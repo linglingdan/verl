@@ -81,6 +81,107 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+# ---------------------------------------------------------------------------
+# Attention-score function (f) for privileged distillation.
+#
+# ``compute_f_attention`` is called **inside a forward hook** immediately
+# after every attention layer finishes its computation, while the full
+# (B, H, S, S) attention-weight matrix is still resident in GPU memory.
+# The hook stores only the *return value* of this function; the raw matrix
+# is discarded once the hook returns, so defining a compact f() keeps peak
+# memory low.
+#
+# ``aggregate_f_attention_layers`` is called once *per forward pass* after
+# all per-layer results have been collected.  It returns a single tensor
+# (or None to skip pipeline integration) that is stored in
+# ``model_output["f_attention"]`` and transported back to the trainer.
+#
+# To activate collection, set ``collect_attention_f=True`` in the
+# TensorDict non-tensor data (e.g. via ``tu.assign_non_tensor``).
+#
+# IMPORTANT: Flash Attention does not materialise attention weights, so
+# ``attn_weights`` will be ``None`` and nothing will be collected.
+# Use ``attn_implementation="eager"`` or ``"sdpa"`` for the forward passes
+# where you need attention scores.
+# ---------------------------------------------------------------------------
+
+
+def compute_f_attention(attn_weights: torch.Tensor) -> torch.Tensor:
+    """User-defined function applied to per-layer attention weights on the fly.
+
+    Called inside a forward hook immediately after each attention layer.
+    The full ``(B, H, S, S)`` attention matrix is available only transiently;
+    after this function returns, only its *return value* is kept.
+
+    Args:
+        attn_weights: Float tensor of shape ``(batch, heads, seq_len, seq_len)``.
+            Contains the softmax attention probabilities.  With Flash Attention
+            this will never be called (weights are not materialised).
+
+    Returns:
+        A float tensor of **any** shape representing the signal you need.
+        The return values from all layers are passed to
+        ``aggregate_f_attention_layers`` for final reduction.
+
+    Current definition (placeholder): returns ones of shape ``(B, L)``,
+    i.e. f(x) = 1 for every token position.
+    Replace the body below with your actual function before running at scale.
+    """
+    # ── INSERT YOUR FUNCTION HERE ──────────────────────────────────────────
+    B, H, S, _ = attn_weights.shape
+    return torch.ones(B, S, dtype=attn_weights.dtype, device=attn_weights.device)  # f(x) = 1, shape (B, L)
+    # ───────────────────────────────────────────────────────────────────────
+
+
+def aggregate_f_attention_layers(
+    per_layer_results: dict,
+) -> "torch.Tensor | None":
+    """Combine per-layer ``compute_f_attention`` outputs into one tensor.
+
+    Called once per forward pass with a ``{layer_idx: tensor}`` dict.
+    Return a tensor to add it to ``model_output["f_attention"]`` and ship it
+    back to the trainer, or return ``None`` to skip.
+
+    Assumes ``compute_f_attention`` returns ``(B, L)`` per layer.
+    Stacks all layers and takes the mean → final shape ``(B, L)``.
+    """
+    # ── INSERT YOUR AGGREGATION HERE ──────────────────────────────────────
+    if not per_layer_results:
+        return None
+    stacked = torch.stack([per_layer_results[i] for i in sorted(per_layer_results)], dim=0)
+    return stacked.mean(dim=0)  # (B, L) – mean over layers
+    # ───────────────────────────────────────────────────────────────────────
+
+
+def _make_attn_f_patch(layer_idx: int, f_attn_results: dict, original_forward):
+    """Return a patched ``forward`` for one self-attention module.
+
+    Unlike a ``register_forward_hook``, this wrapper intercepts the output
+    *before* the parent DecoderLayer can append ``attn_weights`` to its
+    running list.  By replacing ``output[1]`` with ``None`` we prevent
+    HuggingFace from accumulating all L matrices simultaneously, so peak
+    memory stays at O(H·S²) instead of O(L·H·S²).
+
+    The wrapped forward forces ``output_attentions=True`` internally so the
+    caller (``forward_step``) does NOT need to set it on ``model_inputs``.
+    """
+
+    def patched_forward(*args, **kwargs):
+        kwargs["output_attentions"] = True
+        output = original_forward(*args, **kwargs)
+        # HuggingFace self-attention modules return
+        #   (attn_output, attn_weights, *optional_past_kv)
+        if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
+            with torch.no_grad():
+                f_attn_results[layer_idx] = compute_f_attention(output[1].detach())
+            # Suppress attn_weights so the DecoderLayer / Model does NOT
+            # accumulate it in ``all_self_attns``, freeing memory immediately.
+            output = (output[0], None) + output[2:]
+        return output
+
+    return patched_forward
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -1131,6 +1232,31 @@ class FSDPEngineWithLMHead(FSDPEngine):
         if calculate_entropy:
             model_output["entropy"] = entropy
 
+        # Attach f(attention) aggregated result when collect_attention_f was set.
+        # ``aggregate_f_attention_layers`` returns None while the placeholder
+        # f(x)=1 is active; replace both functions to enable pipeline transport.
+        f_attention_agg = aggregate_f_attention_layers(output_args.get("f_attn_results", {}))
+        if f_attention_agg is not None:
+            # Convert to a nested (jagged) tensor so that postprocess_batch_func can
+            # treat it identically to log_probs and restore_dynamic_batch works.
+            #
+            # With use_remove_padding=True the model sees (1, total_tokens) – all
+            # sequences packed – so f_attention_agg is (1, total_tokens).  Squeeze
+            # the batch dim and split by cu_seqlens → one tensor per sample.
+            #
+            # Without remove_padding, the model sees (B, S_max) padded; slice each
+            # row to its true length then pack into a jagged tensor.
+            cu_seqlens = input_ids.offsets()  # input_ids is always the nested tensor
+            if use_remove_padding:
+                f_attn_flat = f_attention_agg.squeeze(0)  # (total_tokens,)
+            else:
+                seq_lengths = cu_seqlens.diff()
+                f_attn_flat = torch.cat(
+                    [f_attention_agg[i, : int(seq_lengths[i])] for i in range(f_attention_agg.shape[0])],
+                    dim=0,
+                )  # (total_tokens,)
+            model_output["f_attention"] = torch.nested.nested_tensor_from_jagged(f_attn_flat, cu_seqlens)
+
         return model_output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
@@ -1139,11 +1265,50 @@ class FSDPEngineWithLMHead(FSDPEngine):
         micro_batch = micro_batch.to(get_device_id())
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
+        # ── Attention-function collection (optional) ────────────────────
+        # Activated by setting ``collect_attention_f=True`` in the batch's
+        # non-tensor data (e.g. via tu.assign_non_tensor).
+        # Requires the model to NOT use flash_attention_2
+        # (set attn_implementation="eager" or "sdpa" at model load time).
+        # Uses regex to match layers.<idx> in the module path, which handles
+        # extra _fsdp_wrapped_module levels inserted by FSDP wrapping.
+        collect_attention_f = tu.get_non_tensor_data(
+            data=micro_batch, key="collect_attention_f", default=False
+        )
+        f_attn_results: dict = {}
+        # Maps module name → (submodule, original_forward) for later restoration.
+        patched_modules: dict = {}
+        if collect_attention_f:
+            import re as _re
+            # Patch each self_attn.forward instead of using register_forward_hook.
+            # This lets each layer release its (B,H,S,S) matrix immediately after
+            # compute_f_attention() runs, keeping peak memory at O(H·S²) rather
+            # than O(L·H·S²).  No need to set output_attentions on model_inputs;
+            # the patch forces it internally per-layer.
+            for name, submodule in self.module.named_modules():
+                if not name.endswith("self_attn"):
+                    continue
+                m = _re.search(r'layers\.(\d+)', name)
+                if m is None:
+                    continue
+                layer_idx = int(m.group(1))
+                original_fwd = submodule.forward
+                patched_modules[name] = (submodule, original_fwd)
+                submodule.forward = _make_attn_f_patch(layer_idx, f_attn_results, original_fwd)
+            print(f"[f_attn debug] patched {len(patched_modules)} self_attn modules")
+        # ───────────────────────────────────────────────────────────────────────
+
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
             raw_output = self.module(
                 **model_inputs,
                 use_cache=False,
             )  # prevent model thinks we are generating
+
+            # Restore original forwards immediately after forward pass.
+            for name, (submodule, original_fwd) in patched_modules.items():
+                submodule.forward = original_fwd
+            if f_attn_results:
+                output_args["f_attn_results"] = f_attn_results
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function

@@ -487,7 +487,7 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        reward_keys = set({"data_source", "reward_model", "extra_info", "uid", "privilege"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -511,7 +511,12 @@ class RayPPOTrainer:
         return batch_reward
 
     def _should_compute_teacher_colocate(self, batch: DataProto) -> bool:
-        return self.use_teacher_policy and not self.distillation_config.teacher_model.enable_resource_pool
+        teacher_loss_weight = self.distillation_config.distillation_loss.teacher_loss_weight
+        return (
+            self.use_teacher_policy
+            and not self.distillation_config.teacher_model.enable_resource_pool
+            and teacher_loss_weight > 0.0
+        )
 
     def _compute_teacher_colocate(self, batch: DataProto) -> DataProto:
         """Compute teacher logprobs after rollout when teacher and student are colocated."""
@@ -853,6 +858,14 @@ class RayPPOTrainer:
                 resource_pool=teacher_resource_pool,
             )
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+            # omega_conf_to_dataclass may leave nested sub-configs as dicts when the
+            # yaml does not carry _target_.  Ensure online_privilege is a proper dataclass.
+            if isinstance(self.distillation_config.online_privilege, dict):
+                from verl.workers.config.distillation import OnlinePrivilegeConfig
+
+                self.distillation_config.online_privilege = OnlinePrivilegeConfig(
+                    **self.distillation_config.online_privilege
+                )
         else:
             self.teacher_model_manager = None
             self.distillation_config = None
@@ -1187,14 +1200,26 @@ class RayPPOTrainer:
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+            # Also collect normal (no-privilege) attention if privileged distillation is active,
+            # so that f_attention_normal can be multiplied with f_attention_privileged as a
+            # joint token-importance weight in the distillation loss.
+            collect_normal_attn = (
+                is_distillation_enabled(self.config.get("distillation"))
+                and self.distillation_config.distillation_loss.use_normal_attention_weight
+            )
+            tu.assign_non_tensor(
+                batch_td,
+                calculate_entropy=True,
+                compute_loss=False,
+                collect_attention_f=collect_normal_attn,
+            )
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
             # gather output
             entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
             routed_experts = tu.get(output, "routed_experts")
 
-            old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
+            old_log_prob_mfu = (tu.get(output, "metrics") or {}).get("mfu", 0)
             # step 4. No padding to padding
             entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
@@ -1205,11 +1230,109 @@ class RayPPOTrainer:
                 )
             else:
                 old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
+            # Collect normal-context attention: f_attention_normal shape (bsz, resp_len).
+            # Stored alongside old_log_probs so it arrives in the training batch via batch.union().
+            if collect_normal_attn:
+                f_attn_normal = tu.get(output, "f_attention")
+                if f_attn_normal is not None:
+                    f_attn_normal_padded = no_padding_2_padding(f_attn_normal, batch_td)
+                    old_log_prob["f_attention_normal"] = f_attn_normal_padded.float()
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
+
+    def _compute_privileged_log_prob(self, batch: DataProto) -> DataProto | None:
+        """Compute response log-probs conditioned on (prompt + privilege + response).
+
+        Constructs a new input sequence ``[prompts | privilege_tokens | responses]`` and
+        runs a no-grad actor forward to get
+        ``P(response_t | prompt, privilege, response_{<t})``.
+
+        The result is stored under key ``"privileged_log_probs"`` (shape: bsz x resp_len),
+        matching the layout of ``"old_log_probs"``.
+
+        Returns None when the batch does not contain a ``"privilege"`` field
+        (i.e., the parquet dataset has no such column), so callers can skip
+        union-ing without special-casing.
+
+        Note: only the ``use_legacy_worker_impl == "disable"`` (new engine) path is
+        supported here – that is the path used by run_qwen_gsm8k.sh.
+        """
+        privilege_texts = batch.non_tensor_batch.get("privilege", None)
+        if privilege_texts is None:
+            return None
+        print(f"[privileged distillation] computing privileged log_probs for batch of {len(privilege_texts)} samples")
+
+        prompts = batch.batch["prompts"]           # (bsz, prompt_len), left-padded
+        responses = batch.batch["responses"]       # (bsz, resp_len),   right-padded
+        attn_mask = batch.batch["attention_mask"]  # (bsz, prompt_len + resp_len)
+        resp_mask = batch.batch["response_mask"]   # (bsz, resp_len)
+
+        bsz, prompt_len = prompts.shape
+        resp_len = responses.shape[1]
+
+        # Tokenize per-sample privilege strings; right-pad to the longest in this batch.
+        privilege_max_len = self.config.get("distillation", {}).get("privilege_max_length", 192)
+        privilege_enc = self.tokenizer(
+            list(privilege_texts),
+            add_special_tokens=False,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=privilege_max_len,
+        )
+        priv_ids = privilege_enc["input_ids"]          # (bsz, priv_len)
+        priv_mask = privilege_enc["attention_mask"]    # (bsz, priv_len)
+
+        # Build extended "prompt region" = original prompts + privilege tokens.
+        # By treating them as one region, no_padding_2_padding will correctly
+        # extract only the response portion from the flat no-padding output.
+        new_prompts = torch.cat([prompts, priv_ids], dim=1)         # (bsz, prompt_len + priv_len)
+        new_input_ids = torch.cat([new_prompts, responses], dim=1)  # (bsz, total_len)
+
+        # Attention mask: original prompt region | privilege tokens | response region
+        prompt_attn = attn_mask[:, :prompt_len]    # (bsz, prompt_len)
+        resp_attn = attn_mask[:, prompt_len:]      # (bsz, resp_len)
+        new_attn_mask = torch.cat([prompt_attn, priv_mask, resp_attn], dim=1)  # (bsz, total_len)
+
+        # Position IDs: assign 0,1,2,... to real tokens; 0 for padding.
+        new_pos_ids = new_attn_mask.long().cumsum(dim=-1) - 1
+        new_pos_ids.masked_fill_(new_attn_mask == 0, 0)
+
+        priv_batch = DataProto.from_dict(
+            tensors={
+                "input_ids": new_input_ids,      # full privileged sequence
+                "prompts": new_prompts,          # extended prompt (for no_padding_2_padding slicing)
+                "responses": responses,          # unchanged response tokens
+                "attention_mask": new_attn_mask,
+                "position_ids": new_pos_ids,
+                "response_mask": resp_mask,      # unchanged; still marks response token positions
+            },
+            meta_info=dict(batch.meta_info),
+        )
+
+        if self.use_legacy_worker_impl == "disable":
+            priv_td = priv_batch.to_tensordict()
+            priv_td = left_right_2_no_padding(priv_td)
+            tu.assign_non_tensor(priv_td, calculate_entropy=False, compute_loss=False, collect_attention_f=True)
+            output = self.actor_rollout_wg.compute_log_prob(priv_td)
+            log_probs = tu.get(output, "log_probs")
+            privileged_log_probs = no_padding_2_padding(log_probs, priv_td)
+            result_td = tu.get_tensordict({"privileged_log_probs": privileged_log_probs.float()})
+            # Extract f(attention) result for the privileged sequence (prompt+privilege+response).
+            # Shape: (bsz, resp_len) after no_padding_2_padding, matching privileged_log_probs layout.
+            f_attention = tu.get(output, "f_attention")
+            if f_attention is not None:
+                f_attention_padded = no_padding_2_padding(f_attention, priv_td)
+                result_td["f_attention_privileged"] = f_attention_padded
+            return DataProto.from_tensordict(result_td)
+        else:
+            # Legacy path: fsdp_workers sets meta_info internally and always returns
+            # the tensor under the key "old_log_probs".
+            output = self.actor_rollout_wg.compute_log_prob(priv_batch)
+            return DataProto.from_dict(tensors={"privileged_log_probs": output.batch["old_log_probs"]})
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -1414,42 +1537,56 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
-                    if self._should_compute_teacher_colocate(batch):
-                        with marked_timer("teacher", timing_raw, color="cyan"):
-                            batch_teacher = self._compute_teacher_colocate(batch)
-                            batch = batch.union(batch_teacher)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-                    # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
 
-                    # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    # get images_seqlens
-                    images_seqlens_all = []
-                    for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
-                        if "image_grid_thw" not in multi_modal_input.keys():
-                            continue
-                        images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
-                    batch.meta_info["images_seqlens"] = images_seqlens_all
+                    # Compute rewards early so that online_privilege can use token_level_scores
+                    # to determine which responses are correct.  The reward block later is a no-op
+                    # if rm_scores / token_level_scores are already present.
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
-
-                        # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        # Set token_level_scores now so online_privilege can read it.
+                        batch.batch["token_level_scores"] = reward_tensor
+
+                    # Privileged forward: compute P(response | prompt + privilege + response)
+                    # to distil the student toward its own counterfactual self with oracle context.
+                    # Requires a "privilege" column in the parquet dataset; silently skipped otherwise.
+                    # When online_privilege.enabled=True the privilege is generated fresh each step
+                    # via an external LLM API call started here in a background thread (submit), so
+                    # that old_log_prob / ref_log_prob / values can overlap with the network round-trips
+                    # before we block on collect() just before balance_batch / privileged_log_prob.
+                    _online_priv_future = None
+                    if (
+                        is_distillation_enabled(self.config.get("distillation"))
+                        and self.distillation_config.online_privilege.enabled
+                    ):
+                        from verl.experimental.privilege_loop.online_privilege import submit_online_privileges
+
+                        with marked_timer("online_privilege_submit", timing_raw, color="yellow"):
+                            op_cfg = self.distillation_config.online_privilege
+                            _online_priv_future = submit_online_privileges(
+                                batch=batch,
+                                tokenizer=self.tokenizer,
+                                server_url=op_cfg.server_url,
+                                model_name=op_cfg.model_name,
+                                system_prompt=op_cfg.system_prompt,
+                                max_tokens=op_cfg.max_tokens,
+                                timeout=op_cfg.timeout,
+                                max_concurrency=op_cfg.max_concurrency,
+                                min_correct=op_cfg.min_correct,
+                                max_context_examples=op_cfg.max_context_examples,
+                                max_prompt_chars=op_cfg.max_prompt_chars,
+                            )
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                    # Runs before collect() so old_log_prob GPU forward overlaps with background API calls.
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
@@ -1496,16 +1633,60 @@ class RayPPOTrainer:
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
-                        # compute reference log_prob
+                        # compute reference log_prob; runs before collect() to overlap with API calls.
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
-                    # compute values
+                    # compute values; runs before collect() to overlap with API calls.
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
                             batch = batch.union(values)
+
+                    # Collect online privilege results — blocks until the background thread finishes.
+                    # By this point old_log_prob / ref_log_prob / values have all run on the GPU,
+                    # so most of the API latency should already be hidden.
+                    # Must run BEFORE balance_batch so that the positional privilege_arr matches batch
+                    # row order; balance_batch will then reorder all fields (including privilege)
+                    # uniformly before privileged_log_prob and teacher consume them.
+                    if _online_priv_future is not None:
+                        from verl.experimental.privilege_loop.online_privilege import collect_online_privileges
+
+                        with marked_timer("online_privilege_collect", timing_raw, color="yellow"):
+                            batch = collect_online_privileges(batch, _online_priv_future)
+                            _online_priv_future = None
+
+                    # Balance the number of valid tokens across DP ranks.
+                    # NOTE: This usually changes the order of data in the `batch`,
+                    # which won't affect the advantage calculation (since it's based on uid),
+                    # but might affect the loss calculation (due to the change of mini-batching).
+                    # Runs after collect() so that privilege, old_log_probs, ref_log_prob, and values
+                    # are all in batch and get reordered uniformly together.
+                    if self.config.trainer.balance_batch:
+                        self._balance_batch(batch, metrics=metrics)
+
+                    # compute global_valid tokens
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    # get images_seqlens
+                    images_seqlens_all = []
+                    for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
+                        if "image_grid_thw" not in multi_modal_input.keys():
+                            continue
+                        images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
+                    batch.meta_info["images_seqlens"] = images_seqlens_all
+                    # reward_tensor and reward_extra_infos_dict already computed above;
+                    # skip re-extraction to avoid double work.
+
+                    with marked_timer("privileged_log_prob", timing_raw, color="green"):
+                        priv_result = self._compute_privileged_log_prob(batch)
+                        if priv_result is not None:
+                            batch = batch.union(priv_result)
+
+                    if self._should_compute_teacher_colocate(batch):
+                        with marked_timer("teacher", timing_raw, color="cyan"):
+                            batch_teacher = self._compute_teacher_colocate(batch)
+                            batch = batch.union(batch_teacher)
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm

@@ -14,6 +14,7 @@
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
+import logging
 
 import torch
 from tensordict import TensorDict
@@ -24,6 +25,8 @@ from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
+
+logger = logging.getLogger(__name__)
 
 DistillationLossFn = Callable[
     [
@@ -234,7 +237,7 @@ def distillation_loss(
     assert distillation_config is not None
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
     distillation_loss_fn = get_distillation_loss_fn(loss_config.loss_mode)
-    distillation_losses, distillation_metrics = distillation_loss_fn(
+    distillation_losses, distillation_metrics, f_attn_for_adv = distillation_loss_fn(
         config=config,
         distillation_config=distillation_config,
         model_output=model_output,
@@ -251,17 +254,36 @@ def distillation_loss(
         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
 
     if loss_config.use_policy_gradient:
-        # Use negative distillation loss as reward, as done by https://thinkingmachines.ai/blog/on-policy-distillation/.
+        # When f_attn is available: multiply it onto the GRPO task advantage so that PPO
+        # focuses gradient updates on tokens the model attends to most under privilege context.
+        # When f_attn is not available: fall back to using -KL as the per-token advantage,
+        # which is the original on-policy distillation behaviour.
         policy_loss_fn = get_policy_loss_fn(loss_config.policy_loss_mode)
         for k, v in config.global_batch_info.items():
             loss_config.global_batch_info[k] = v
         log_prob = no_padding_2_padding(model_output["log_probs"], data)
         old_log_prob = data["old_log_probs"]
         rollout_is_weights = data.get("rollout_is_weights", None)
+
+        if f_attn_for_adv is not None and "advantages" in data.keys():
+            # New path: attention-weighted task advantage.
+            # f_attn_for_adv is already normalised (mean=1 over response tokens) and masked.
+            # Multiplying preserves the overall advantage magnitude while re-distributing
+            # gradient emphasis to high-attention token positions.
+            task_advantages = data["advantages"].to(f_attn_for_adv.dtype)
+            weighted_advantages = task_advantages * f_attn_for_adv
+            distillation_metrics["distillation/adv_attn_weighted"] = Metric(
+                AggregationType.MEAN,
+                weighted_advantages[response_mask.bool()].mean(),
+            )
+        else:
+            # Original path: treat -KL per token as the per-token advantage.
+            weighted_advantages = -distillation_losses.detach()
+
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
-            advantages=-distillation_losses.detach(),
+            advantages=weighted_advantages,
             response_mask=response_mask,
             loss_agg_mode=loss_agg_mode,
             config=loss_config,
@@ -316,7 +338,8 @@ def compute_forward_kl_topk(
     # Due to use of top-k, student and teacher distributions don't sum to 1 -> divergences can be negative.
     distillation_losses = distillation_losses.clamp_min(0.0)
 
-    return distillation_losses, distillation_metrics
+    # topk path has no f_attention
+    return distillation_losses, distillation_metrics, None
 
 
 @register_distillation_loss(
@@ -339,16 +362,82 @@ def compute_distillation_loss_reverse_kl_estimator(
     - distillation_metrics: Dictionary of metrics.
     """
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
-    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
     response_mask_bool = data["response_mask"].bool()
-    assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
 
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
-    distillation_losses = kl_penalty(
-        logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty=loss_config.loss_mode
-    )
+    if loss_config.teacher_loss_weight > 0.0:
+        teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+        assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
+        distillation_losses = kl_penalty(
+            logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty=loss_config.loss_mode
+        ) * loss_config.teacher_loss_weight
+    else:
+        distillation_losses = torch.zeros_like(student_log_probs)
     # Since k1 can be negative, log the mean absolute loss.
     metrics = {
         "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
     }
-    return distillation_losses, metrics
+
+    # Compute f_attn here so it is available both for privileged_losses weighting
+    # and (when use_policy_gradient=True) for multiplying onto the task advantage.
+    # f_attn_for_adv is None when no attention keys are present.
+    f_attn_for_adv: torch.Tensor | None = None
+
+    # Privileged distillation: push student toward its own privileged-context self.
+    if "privileged_log_probs" in data.keys():
+        privileged_log_probs = data["privileged_log_probs"]  # (bsz, resp_len), already padded
+        assert privileged_log_probs.shape == student_log_probs.shape, (
+            f"privileged_log_probs shape {privileged_log_probs.shape} "
+            f"!= student_log_probs shape {student_log_probs.shape}"
+        )
+        privileged_losses = kl_penalty(
+            logprob=student_log_probs,
+            ref_logprob=privileged_log_probs,
+            kl_penalty=loss_config.loss_mode,
+        )
+        if "f_attention_privileged" in data.keys():
+            f_attn = data["f_attention_privileged"].to(privileged_losses.dtype)
+            # Joint weighting: multiply privileged attention with normal-context attention.
+            # f_attention_normal either comes from data (legacy path) or from model_output["f_attention"]
+            # which is populated when collect_attention_f=True is set during the training forward pass.
+            if "f_attention_normal" in data.keys():
+                f_attn_normal = data["f_attention_normal"].to(f_attn.dtype)
+            elif "f_attention" in model_output:
+                f_attn_normal_raw = no_padding_2_padding(model_output["f_attention"], data)
+                f_attn_normal = f_attn_normal_raw.to(f_attn.dtype)
+            else:
+                f_attn_normal = None
+            if f_attn_normal is not None:
+                f_attn = f_attn * f_attn_normal
+                f_attn_normal_valid = f_attn_normal[response_mask_bool]
+                metrics["distillation/f_attn_normal_mean"] = Metric(AggregationType.MEAN, f_attn_normal_valid.mean())
+                metrics["distillation/f_attn_normal_max"] = Metric(AggregationType.MEAN, f_attn_normal_valid.max())
+            # Mask out non-response positions and normalise so that the mean weight = 1
+            # (keeps loss magnitude stable regardless of absolute attention values).
+            f_attn = f_attn * response_mask_bool
+            f_attn_sum = f_attn.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            f_attn_normalised = f_attn / f_attn_sum * response_mask_bool.sum(dim=-1, keepdim=True)
+            privileged_losses = privileged_losses * f_attn_normalised
+            # Save for re-use in the policy_gradient advantage branch below.
+            f_attn_for_adv = f_attn_normalised
+            f_attn_valid = f_attn_normalised[response_mask_bool]
+            metrics["distillation/f_attn_mean"] = Metric(AggregationType.MEAN, f_attn_valid.mean())
+            metrics["distillation/f_attn_max"] = Metric(AggregationType.MEAN, f_attn_valid.max())
+            logger.info(
+                "[f_attention] active | f_attn_mean=%.4f | f_attn_max=%.4f",
+                f_attn_valid.mean().item(),
+                f_attn_valid.max().item(),
+            )
+        distillation_losses = distillation_losses + loss_config.privilege_loss_weight * privileged_losses
+        priv_abs = privileged_losses[response_mask_bool].abs().mean()
+        metrics["distillation/privileged_abs_loss"] = Metric(AggregationType.MEAN, priv_abs)
+        logger.info(
+            "[privileged distillation] active | bsz=%d | privilege_loss_weight=%.3f | "
+            "privileged_abs_loss=%.4f | teacher_abs_loss=%.4f",
+            student_log_probs.shape[0],
+            loss_config.privilege_loss_weight,
+            priv_abs.item(),
+            distillation_losses[response_mask_bool].abs().mean().item(),
+        )
+
+    return distillation_losses, metrics, f_attn_for_adv

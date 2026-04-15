@@ -16,6 +16,11 @@ enabled: false
 # we launch num_workers teacher managers to parallelize the teacher logprob computation
 num_workers: 8
 
+# Max token length to truncate the per-sample "privilege" string when building the
+# privileged forward sequence [prompt | privilege | response]. Only used when the
+# dataset contains a "privilege" column. 0 means unlimited (not recommended).
+privilege_max_length: 192
+
 # distillation loss config
 distillation_loss:
 
@@ -56,6 +61,31 @@ distillation_loss:
 
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
+
+  # Weight for the privileged distillation k1 loss term
+  # (student_log_probs - privileged_log_probs). Set to 0.0 to disable.
+  # Only active when the dataset has a "privilege" column.
+  teacher_loss_weight: 1.0
+  privilege_loss_weight: 1.0
+  use_normal_attention_weight: true
+
+# Whether the teacher computes log-probs on [prompt | privilege | response] (True)
+# or the default [prompt | response] (False). Requires "privilege" column in dataset.
+teacher_use_privilege: true
+
+# Online privilege generation — calls an external LLM each step to produce a
+# per-response personalised "privilege" string from the full rollout group context.
+# Requires rollout.n > 1 so multiple responses per prompt are available.
+online_privilege:
+  enabled: false
+  server_url: "http://localhost:8001/v1/chat/completions"
+  model_name: ""
+  max_tokens: 200
+  timeout: 30.0
+  max_concurrency: 32
+  min_correct: 1
+  max_context_examples: 3
+  system_prompt: ""
 
 
 # teacher model config

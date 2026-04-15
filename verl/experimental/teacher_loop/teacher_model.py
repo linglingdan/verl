@@ -112,6 +112,7 @@ class TeacherModelManager:
             load_balancer_handle=self.load_balancer_handle,
             distillation_config=self.config,
             pad_token_id=self.pad_token_id,
+            tokenizer=self.tokenizer,
         )
 
     def _initialize_router(self):

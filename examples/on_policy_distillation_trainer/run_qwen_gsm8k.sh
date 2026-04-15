@@ -68,6 +68,7 @@ MODEL=(
     actor_rollout_ref.model.enable_gradient_checkpointing=True
     actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.model.use_fused_kernels=$USE_FUSED_KERNELS
+    actor_rollout_ref.model.attn_implementation=eager
     actor_rollout_ref.actor.use_torch_compile=True
     actor_rollout_ref.rollout.enforce_eager=$ENFORCE_EAGER
 )

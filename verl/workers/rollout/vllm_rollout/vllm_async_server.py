@@ -366,6 +366,20 @@ class vLLMHttpServer:
             cmds[server_args.subparser].validate(server_args)
 
         # 3. launch server
+        # Release the reservation sockets now, just before vLLM's spawned worker
+        # processes try to bind to the same ports as TCPStore / NCCL rendezvous.
+        # The sockets were held open to prevent other actors from grabbing the same
+        # ports; releasing them here is safe because all actors have already
+        # received their port assignments via get_master_address().
+        for sock_attr in ("_master_sock", "_dp_rpc_sock", "_dp_master_sock"):
+            sock = getattr(self, sock_attr, None)
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                setattr(self, sock_attr, None)
+
         if self.node_rank == 0:
             await self.run_server(server_args)
         else:

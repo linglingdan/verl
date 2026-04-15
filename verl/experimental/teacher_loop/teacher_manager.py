@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import logging
+import os
 from typing import Any, Optional
 from uuid import uuid4
 
 import ray
 import torch
 from omegaconf import DictConfig
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARNING"))
 from tensordict import TensorDict
 from torch.nn import functional as F
 
@@ -63,9 +68,18 @@ def _pad_teacher_outputs(
     )
 
 
-def _unpad_teacher_inputs(data: DataProto) -> tuple[list[int], int, int]:
+def _unpad_teacher_inputs(
+    data: DataProto,
+    privilege_text: Optional[str] = None,
+    tokenizer=None,
+    privilege_max_length: int = 0,
+) -> tuple[list[int], int, int, int]:
     """Unpad valid sequence ids and prompt/response lengths from a single sample.
     The sample is a left-padded prompt concatenated with a right-padded response.
+
+    When privilege_text is provided, the privilege tokens are inserted between
+    prompt and response, yielding [prompt | privilege | response] for the teacher.
+    Returns (sequence_ids, valid_prompt_length, valid_response_length, priv_length).
     TODO(wuxibin): remove padding and use tensordict.
     """
     assert len(data) == 1, "Teacher logprob computation expects a single sample"
@@ -80,9 +94,40 @@ def _unpad_teacher_inputs(data: DataProto) -> tuple[list[int], int, int]:
     valid_prompt_length = int(attention_mask[:prompt_width].sum().item())
     valid_response_length = int(attention_mask[-response_width:].sum().item())
     prompt_num_padding = prompt_width - valid_prompt_length
-    sequence_ids = input_ids[prompt_num_padding : prompt_width + valid_response_length]
+    prompt_ids = input_ids[prompt_num_padding : prompt_width]
+    response_ids = input_ids[prompt_width : prompt_width + valid_response_length]
+
+    if privilege_text is not None and tokenizer is not None:
+        max_len = privilege_max_length if privilege_max_length > 0 else None
+        priv_enc = tokenizer(
+            privilege_text,
+            add_special_tokens=False,
+            return_tensors="pt",
+            truncation=max_len is not None,
+            max_length=max_len,
+        )
+        priv_ids = priv_enc["input_ids"][0].to(input_ids.device)
+        priv_length = len(priv_ids)
+        sequence_ids = torch.cat([prompt_ids, priv_ids, response_ids], dim=0)
+        logger.warning(
+            "[teacher_privilege] seq_len=%d (prompt=%d + priv=%d + response=%d)",
+            len(sequence_ids),
+            len(prompt_ids),
+            priv_length,
+            len(response_ids),
+        )
+    else:
+        priv_length = 0
+        sequence_ids = torch.cat([prompt_ids, response_ids], dim=0)
+        logger.warning(
+            "[teacher_privilege] seq_len=%d (prompt=%d + response=%d, no privilege)",
+            len(sequence_ids),
+            len(prompt_ids),
+            len(response_ids),
+        )
+
     sequence_ids = normalize_token_ids(sequence_ids)
-    return sequence_ids, valid_prompt_length, valid_response_length
+    return sequence_ids, valid_prompt_length, valid_response_length, priv_length
 
 
 class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
@@ -95,6 +140,7 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         load_balancer_handle: ray.actor.ActorHandle,
         distillation_config: DictConfig | DistillationConfig,
         pad_token_id: int,
+        tokenizer=None,
     ):
         super().__init__(config=config, servers=servers, load_balancer_handle=load_balancer_handle)
         if isinstance(distillation_config, DistillationConfig):
@@ -103,6 +149,8 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(distillation_config)
         self.distillation_loss_config: DistillationLossConfig = self.distillation_config.distillation_loss
         self.pad_token_id = pad_token_id
+        # Tokenizer used to encode privilege strings when teacher_use_privilege=True
+        self.tokenizer = tokenizer
 
     async def compute_teacher_logprobs_single(
         self,
@@ -128,17 +176,38 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
     async def compute_teacher_logprobs_batch(self, data: DataProto) -> DataProto:
         """Compute teacher log probabilities for a batch of prompt-response pairs."""
         multi_modal_data_batch = data.non_tensor_batch.get("teacher_multi_modal_data")
+        # Privilege support: if teacher_use_privilege is set, pass privilege texts so the
+        # teacher sees [prompt | privilege | response] instead of [prompt | response].
+        use_privilege = getattr(self.distillation_config, "teacher_use_privilege", False)
+        privilege_texts = data.non_tensor_batch.get("privilege") if use_privilege else None
+        privilege_max_length = getattr(self.distillation_config, "privilege_max_length", 0)
+        tokenizer = getattr(self, "tokenizer", None)
+        logger.warning(
+            "[teacher_privilege] use_privilege=%s, privilege_texts_available=%s, batch_size=%d",
+            use_privilege,
+            privilege_texts is not None,
+            len(data),
+        )
         tasks = []
         lengths = []
         prompt_width = data.batch["prompts"].shape[1]
         response_width = data.batch["responses"].shape[1]
 
+        priv_lengths = []
+
         # Compute logprobs for each sample in the batch
         for i in range(len(data)):
             item = data[i : i + 1]
-            sequence_ids, prompt_length, response_length = _unpad_teacher_inputs(item)
+            privilege_text = privilege_texts[i] if privilege_texts is not None else None
+            sequence_ids, prompt_length, response_length, priv_length = _unpad_teacher_inputs(
+                item,
+                privilege_text=privilege_text,
+                tokenizer=tokenizer,
+                privilege_max_length=privilege_max_length,
+            )
             multi_modal_data = None if multi_modal_data_batch is None else multi_modal_data_batch[i]
             lengths.append((prompt_length, response_length))
+            priv_lengths.append(priv_length)
             tasks.append(
                 asyncio.create_task(
                     self.compute_teacher_logprobs_single(
@@ -152,7 +221,18 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         # Pad the teacher logprobs and ids
         padded_teacher_ids = []
         padded_teacher_logprobs = []
-        for (teacher_ids, teacher_logprobs), (prompt_length, response_length) in zip(outputs, lengths, strict=True):
+        for (teacher_ids, teacher_logprobs), (prompt_length, response_length), priv_length in zip(
+            outputs, lengths, priv_lengths, strict=True
+        ):
+            # Strip the privilege tokens (middle segment) so the tensor is back to
+            # [prompt | response] shape before padding to [prompt_width | response_width].
+            if priv_length > 0:
+                teacher_ids = torch.cat(
+                    [teacher_ids[:prompt_length], teacher_ids[prompt_length + priv_length :]], dim=0
+                )
+                teacher_logprobs = torch.cat(
+                    [teacher_logprobs[:prompt_length], teacher_logprobs[prompt_length + priv_length :]], dim=0
+                )
             padded_ids, padded_logprobs = _pad_teacher_outputs(
                 teacher_ids,
                 teacher_logprobs,

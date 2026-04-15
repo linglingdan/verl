@@ -917,6 +917,17 @@ class AgentLoopWorker:
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
             non_tensor_batch.update(input_non_tensor_batch)
 
+        # Privileged distillation: always forward "privilege" from the input batch,
+        # regardless of whether streaming reward is enabled.  The field is needed by
+        # _compute_privileged_log_prob() in ray_trainer.py and must survive the
+        # reward_loop_worker_handles branch that skips the full non_tensor_batch merge.
+        if (
+            input_non_tensor_batch is not None
+            and "privilege" in input_non_tensor_batch
+            and "privilege" not in non_tensor_batch
+        ):
+            non_tensor_batch["privilege"] = input_non_tensor_batch["privilege"]
+
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
         reward_extra_keys = list(reward_extra_infos[0].keys())
