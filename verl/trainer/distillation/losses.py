@@ -398,16 +398,11 @@ def compute_distillation_loss_reverse_kl_estimator(
         if "f_attention_privileged" in data.keys():
             f_attn = data["f_attention_privileged"].to(privileged_losses.dtype)
             # Joint weighting: multiply privileged attention with normal-context attention.
-            # f_attention_normal either comes from data (legacy path) or from model_output["f_attention"]
-            # which is populated when collect_attention_f=True is set during the training forward pass.
+            # f_attention_normal comes from a no-privilege forward pass over [prompt | response],
+            # giving the model's baseline per-token importance without oracle context.
+            # The product highlights tokens that are BOTH important normally AND shift under privilege.
             if "f_attention_normal" in data.keys():
                 f_attn_normal = data["f_attention_normal"].to(f_attn.dtype)
-            elif "f_attention" in model_output:
-                f_attn_normal_raw = no_padding_2_padding(model_output["f_attention"], data)
-                f_attn_normal = f_attn_normal_raw.to(f_attn.dtype)
-            else:
-                f_attn_normal = None
-            if f_attn_normal is not None:
                 f_attn = f_attn * f_attn_normal
                 f_attn_normal_valid = f_attn_normal[response_mask_bool]
                 metrics["distillation/f_attn_normal_mean"] = Metric(AggregationType.MEAN, f_attn_normal_valid.mean())
